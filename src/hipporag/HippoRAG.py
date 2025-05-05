@@ -31,6 +31,7 @@ from .utils.misc_utils import *
 from .utils.embed_utils import retrieve_knn
 from .utils.typing import Triple
 from .utils.config_utils import BaseConfig
+from src.hipporag.prompts.templates import entailment_template
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +212,20 @@ class HippoRAG:
 
         assert False, logger.info('Done with OpenIE, run online indexing for future retrieval.')
 
+    def get_entity_nodes2chunk_ids(self, triple_results_dict: Dict[str, TripleRawOutput]):
+        chunk2triples = {chunk_id: [text_processing(t) for t in triple_results_dict[chunk_id].triples] for chunk_id in triple_results_dict}
+        entity_nodes2chunk_ids = defaultdict(set)
+        entity_nodes2triples = defaultdict(set)
+        for chunk_id, triples in chunk2triples.items():
+            for triple in triples:
+                triple = tuple(triple)
+                if len(triple) == 3:
+                    entity_nodes2chunk_ids[triple[0]].add(chunk_id)
+                    entity_nodes2chunk_ids[triple[2]].add(chunk_id)
+                    entity_nodes2triples[triple[0]].add(triple)
+                    entity_nodes2triples[triple[2]].add(triple)
+        return entity_nodes2chunk_ids, entity_nodes2triples, chunk2triples
+
     def index(self, docs: List[str]):
         """
         Indexes the given documents based on the HippoRAG 2 framework which generates an OpenIE knowledge graph
@@ -249,11 +264,13 @@ class HippoRAG:
         chunk_ids = list(chunk_to_rows.keys())
 
         chunk_triples = [[text_processing(t) for t in triple_results_dict[chunk_id].triples] for chunk_id in chunk_ids]
+
+        entity_nodes2chunk_ids, entity_nodes2triples, chunk2triples = self.get_entity_nodes2chunk_ids(triple_results_dict)
         entity_nodes, chunk_triple_entities = extract_entity_nodes(chunk_triples)
         facts = flatten_facts(chunk_triples)
 
         logger.info(f"Encoding Entities")
-        self.entity_embedding_store.insert_strings(entity_nodes)
+        self.entity_embedding_store.insert_entities(entity_nodes2chunk_ids, entity_nodes2triples, chunk_to_rows, self.global_config.same_entity_threshold, self.prompt_template_manager, self.llm_model)
 
         logger.info(f"Encoding Facts")
         self.fact_embedding_store.insert_strings([str(fact) for fact in facts])
@@ -262,6 +279,7 @@ class HippoRAG:
 
         self.node_to_node_stats = {}
         self.ent_node_to_chunk_ids = {}
+        self.entailment_edges = {}
 
         self.add_fact_edges(chunk_ids, chunk_triples)
         num_new_chunks = self.add_passage_edges(chunk_ids, chunk_triple_entities)
@@ -359,7 +377,7 @@ class HippoRAG:
     def retrieve(self,
                  queries: List[str],
                  num_to_retrieve: int = None,
-                 gold_docs: List[List[str]] = None) -> List[QuerySolution] | Tuple[List[QuerySolution], Dict]:
+                 gold_docs: List[List[str]] = None) -> Union[List[QuerySolution], Tuple[List[QuerySolution], Dict]]:
         """
         Performs retrieval using the HippoRAG 2 framework, which consists of several steps:
         - Fact Retrieval
@@ -445,9 +463,9 @@ class HippoRAG:
             return retrieval_results
 
     def rag_qa(self,
-               queries: List[str|QuerySolution],
+               queries: List[Union[str, QuerySolution]],
                gold_docs: List[List[str]] = None,
-               gold_answers: List[List[str]] = None) -> Tuple[List[QuerySolution], List[str], List[Dict]] | Tuple[List[QuerySolution], List[str], List[Dict], Dict, Dict]:
+               gold_answers: List[List[str]] = None) -> Union[Tuple[List[QuerySolution], List[str], List[Dict]], Tuple[List[QuerySolution], List[str], List[Dict], Dict, Dict]]:
         """
         Performs retrieval-augmented generation enhanced QA using the HippoRAG 2 framework.
 
@@ -521,7 +539,7 @@ class HippoRAG:
     def retrieve_dpr(self,
                      queries: List[str],
                      num_to_retrieve: int = None,
-                     gold_docs: List[List[str]] = None) -> List[QuerySolution] | Tuple[List[QuerySolution], Dict]:
+                     gold_docs: List[List[str]] = None) -> Union[List[QuerySolution], Tuple[List[QuerySolution], Dict]]:
         """
         Performs retrieval using a DPR framework, which consists of several steps:
         - Dense passage scoring
@@ -590,9 +608,9 @@ class HippoRAG:
             return retrieval_results
 
     def rag_qa_dpr(self,
-               queries: List[str|QuerySolution],
+               queries: List[Union[str, QuerySolution]],
                gold_docs: List[List[str]] = None,
-               gold_answers: List[List[str]] = None) -> Tuple[List[QuerySolution], List[str], List[Dict]] | Tuple[List[QuerySolution], List[str], List[Dict], Dict, Dict]:
+               gold_answers: List[List[str]] = None) -> Union[Tuple[List[QuerySolution], List[str], List[Dict]], Tuple[List[QuerySolution], List[str], List[Dict], Dict, Dict]]:
         """
         Performs retrieval-augmented generation enhanced QA using a standard DPR framework.
 
@@ -759,11 +777,10 @@ class HippoRAG:
                     node_key = compute_mdhash_id(content=triple[0], prefix=("entity-"))
                     node_2_key = compute_mdhash_id(content=triple[2], prefix=("entity-"))
 
+                    # 只创建单向边 subject -> object
                     self.node_to_node_stats[(node_key, node_2_key)] = self.node_to_node_stats.get(
                         (node_key, node_2_key), 0.0) + 1
-                    self.node_to_node_stats[(node_2_key, node_key)] = self.node_to_node_stats.get(
-                        (node_2_key, node_key), 0.0) + 1
-
+                    
                     entities_in_chunk.add(node_key)
                     entities_in_chunk.add(node_2_key)
 
@@ -822,6 +839,10 @@ class HippoRAG:
         a nearest neighbor (KNN) search to find similar nodes. These similar nodes are identified based on a score threshold, and edges
         are added to represent the synonym relationship.
 
+        The method now also uses LLM-based entailment detection to determine edge directionality:
+        - If entity1 entails entity2 and entity2 entails entity1, creates an undirected edge
+        - Otherwise, creates a directed edge based on the entailment direction
+        
         Attributes:
             entity_id_to_row: dict (populated within the function). Maps each entity ID to its corresponding row data, where rows
                               contain `content` of entities used for comparison.
@@ -851,6 +872,11 @@ class HippoRAG:
 
         num_synonym_triple = 0
         synonym_candidates = []  # [(node key, [(synonym node key, corresponding score), ...]), ...]
+        # Using the imported template instead of hardcoding it
+        
+
+        self.node_to_node_stats[(node_key, nn)] = score
+        self.node_to_node_stats[(nn, node_key)] = score
 
         for node_key in tqdm(query_node_key2knn_node_keys.keys(), total=len(query_node_key2knn_node_keys)):
             synonyms = []
@@ -868,14 +894,34 @@ class HippoRAG:
                     nn_phrase = self.entity_id_to_row[nn]["content"]
 
                     if nn != node_key and nn_phrase != '':
-                        sim_edge = (node_key, nn)
+                        # Check entailment in both directions using LLM
+                        forward_prompt = entailment_template.format(clause1=entity, clause2=nn_phrase)
+                        backward_prompt = entailment_template.format(clause1=nn_phrase, clause2=entity)
+                        
+                        # Call LLM to determine entailment
+                        forward_result = self.llm_model.infer([{"role": "user", "content": forward_prompt}])[0].lower().strip()
+                        backward_result = self.llm_model.infer([{"role": "user", "content": backward_prompt}])[0].lower().strip()
+                        
+                        is_forward_entailment = "yes" in forward_result
+                        is_backward_entailment = "yes" in backward_result
+                        
                         synonyms.append((nn, score))
                         num_synonym_triple += 1
 
-                        self.node_to_node_stats[sim_edge] = score  # Need to seriously discuss on this
+                        # 使用不同的权重标记不同类型的蕴含关系边
+                        if is_forward_entailment and is_backward_entailment:
+                            self.entailment_edges[(node_key, nn)] = score
+                            self.entailment_edges[(nn, node_key)] = score
+                        elif is_forward_entailment:
+                            self.entailment_edges[(node_key, nn)] = score
+                        elif is_backward_entailment:
+                            self.entailment_edges[(nn, node_key)] = score
+                        
                         num_nns += 1
 
             synonym_candidates.append((node_key, synonyms))
+        
+        logger.info(f"Added {num_synonym_triple} edges based on synonymy and entailment relationships")
 
     def load_existing_openie(self, chunk_keys: List[str]) -> Tuple[List[dict], Set[str]]:
         """
@@ -899,6 +945,7 @@ class HippoRAG:
         chunk_keys_to_save = set()
 
         if not self.global_config.force_openie_from_scratch and os.path.isfile(self.openie_results_path):
+
             openie_results = json.load(open(self.openie_results_path))
             all_openie_info = openie_results.get('docs', [])
 
@@ -1178,7 +1225,7 @@ class HippoRAG:
 
         self.ready_to_retrieve = True
 
-    def get_query_embeddings(self, queries: List[str] | List[QuerySolution]):
+    def get_query_embeddings(self, queries: Union[List[str], List[QuerySolution]]):
         """
         Retrieves embeddings for given queries and updates the internal query-to-embedding mapping. The method determines whether each query
         is already present in the `self.query_to_embedding` dictionary under the keys 'triple' and 'passage'. If a query is not present in
@@ -1487,7 +1534,7 @@ class HippoRAG:
         pagerank_scores = self.graph.personalized_pagerank(
             vertices=range(len(self.node_name_to_vertex_idx)),
             damping=damping,
-            directed=False,
+            directed=self.global_config.is_directed_graph,
             weights='weight',
             reset=reset_prob,
             implementation='prpack'

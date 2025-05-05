@@ -263,7 +263,7 @@ export CUDA_VISIBLE_DEVICES=2,3  # set another GPUs while vLLM server is running
 export HF_HOME=<path to Huggingface home directory>
 dataset=sample
 
-python main.py --dataset $dataset --llm_base_url http://localhost:8000/v1 --llm_name meta-llama/Llama-3.3-70B-Instruct --embedding_name nvidia/NV-Embed-v2
+python main.py --dataset musique --llm_base_url http://localhost:8000/v1 --llm_name microsoft/phi-4 --embedding_name facebook/contriever
 ```
 
 #### Advanced: Run with vLLM offline batch
@@ -447,3 +447,8 @@ If you find this work useful, please consider citing our papers:
 - [ ] Add support for vector database integration
 
 Please feel free to open an issue or PR if you have any questions or suggestions.
+
+
+CUDA_VISIBLE_DEVICES=1 python -m vllm.entrypoints.openai.api_server \
+    --model microsoft/phi-4 \
+    --gpu-memory-utilization 0.95

@@ -55,6 +55,10 @@ class BaseConfig:
         default_factory=lambda: { "type": "json_object" },
         metadata={"help": "Specifying the format that the model must output."}
     )
+    same_entity_threshold: float = field(
+        default=0.6,
+        metadata={"help": "Threshold for same entity detection."}
+    )
     
     ## LLM specific attributes -> Async hyperparameters
     max_retry_attempts: int = field(
@@ -162,7 +166,7 @@ class BaseConfig:
         metadata={"help": "Similarity threshold to include candidate synonymy nodes."}
     )
     is_directed_graph: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Whether the graph is directed or not."}
     )
     
