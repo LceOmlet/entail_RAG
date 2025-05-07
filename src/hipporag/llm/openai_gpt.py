@@ -195,5 +195,34 @@ class CacheOpenAI(BaseLLM):
         }
 
         return response_message, metadata
+    
+    @dynamic_retry_decorator
+    def infer_(
+        self,
+        messages: List[TextChatMessage],
+        **kwargs
+    ) -> Tuple[List[TextChatMessage], dict]:
+        params = deepcopy(self.llm_config.generate_params)
+        if kwargs:
+            params.update(kwargs)
+        params["messages"] = messages
+        logger.debug(f"Calling OpenAI GPT API with:\n{params}")
+
+        if 'gpt' not in params['model'] or version.parse(openai.__version__) < version.parse("1.45.0"): # if we use vllm to call openai api or if we use openai but the version is too old to use 'max_completion_tokens' argument
+            # TODO strange version change in openai protocol, but our current vllm version not changed yet
+            params['max_tokens'] = params.pop('max_completion_tokens')
+
+        response = self.openai_client.chat.completions.create(**params)
+
+        response_message = response.choices[0].message.content
+        assert isinstance(response_message, str), "response_message should be a string"
+        
+        metadata = {
+            "prompt_tokens": response.usage.prompt_tokens, 
+            "completion_tokens": response.usage.completion_tokens,
+            "finish_reason": response.choices[0].finish_reason,
+        }
+
+        return response_message, metadata
 
 

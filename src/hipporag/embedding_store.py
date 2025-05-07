@@ -1,12 +1,18 @@
+import os
+
+from src.hipporag.llm import _get_llm_class
+# Disable Ray auto-initialization
+os.environ["RAY_DISABLE_INIT"] = "1"
+
+import asyncio
 import numpy as np
 from tqdm import tqdm
-import os
 from typing import Union, Optional, List, Dict, Set, Any, Tuple, Literal
 import logging
 from copy import deepcopy
 import pandas as pd
 
-from .utils.misc_utils import compute_mdhash_id, NerRawOutput, TripleRawOutput, text_processing
+from .utils.misc_utils import compute_mdhash_id, NerRawOutput, TripleRawOutput, text_processing, run_with_dynamic_pool
 
 logger = logging.getLogger(__name__)
 
@@ -60,68 +66,118 @@ class EmbeddingStore:
 
         return {h: {"hash_id": h, "content": t} for h, t in zip(missing_ids, texts_to_encode)}
     
-    def insert_entities(self, entity_nodes2chunk_ids: Dict[str, List[str]], entity_nodes2triples: Dict[str, List[List[str]]], chunk_to_rows: Dict[str, Dict],  same_entity_threshold: float, prompt_template_manager, llm_model):
+    def insert_entities(self, entity_nodes2chunk_ids: Dict[str, List[str]], entity_nodes2triples: Dict[str, List[List[str]]], chunk_to_rows: Dict[str, Dict],  same_entity_threshold: float, prompt_template_manager, global_config):
         definitions = []
-        for entity in tqdm(entity_nodes2chunk_ids.keys()):
-            passages = [f"Record about \"{entity}\": {chunk_to_rows[chunk_id]['content']}" for chunk_id in entity_nodes2chunk_ids[entity]]
-            entities_with_definition = []
-            embeddings = self.embedding_model.batch_encode(passages)
-            def disambiguate_entity(entity, passages, same_entity_threshold, prompt_template_manager, llm_model, entities_with_definition, embeddings, definition_embeddings=None):
+        async def disambiguate_entity(entity, passages, same_entity_threshold, prompt_template_manager, llm_model, embeddings, entities_with_definition=None, definition_embeddings=None):
+            
+            if entities_with_definition is None:
+                entities_with_definition = []
 
-                if len(passages) == 0:
-                    return
-                if len(passages + entities_with_definition) == 1:
-                    entities_with_definition.append(entity)
-                    return
+            if len(passages) == 0:
+                return entities_with_definition
+            if len(passages + entities_with_definition) == 1:
+                entities_with_definition.append(entity)
+                return entities_with_definition
+            
+            # take account of the current definitions
+            num_current_definitions = len(entities_with_definition)
+            
+            # get the first paragraph to define the entity
+            entity_definition = prompt_template_manager.render(name="disambiguation_paragraph", named_entity=entity, passage=passages[0])
+            entity_definition, meta_data = llm_model.infer_(entity_definition)
+            
+            if entity_definition in ["date.", "number.", "time."]:
+                return [f"{entity}@def: {entity_definition}"]
+
+            this_definition_embedding = self.embedding_model.batch_encode([f"{entity}: {entity_definition}"])
+
+            embeddings =  np.concatenate([embeddings[1:]]) 
+            if definition_embeddings is not None:
+                embeddings = np.concatenate([embeddings, definition_embeddings]) 
+            
+            # the definition entails the same entity
+            similarities = this_definition_embedding[0] @ embeddings.T
+            connections = similarities > same_entity_threshold
+
+            # print(len(connections), len(passages), len(entities_with_definition), len(embeddings))
+
+            assert len(connections) == len(passages) + num_current_definitions - 1    
+
+            collapsed = False
+            if num_current_definitions > 0:
+                cd_connections = connections[-num_current_definitions:]
+                connections = connections[:len(passages) - 1]
+                first_true_idx = None
+                indices_to_remove = []
                 
-                # take account of the current definitions
-                num_current_definitions = len(entities_with_definition)
+                # First pass: find the first True and mark other True indices for removal
+                for i in range(len(cd_connections)):
+                    if cd_connections[i]:
+                        if first_true_idx is None:
+                            # Keep the first True connection
+                            first_true_idx = i
+                            collapsed = True
+                        else:
+                            # Mark this index for removal
+                            indices_to_remove.append(i)
                 
-                # get the first paragraph to define the entity
-                entity_definition = prompt_template_manager.render(name="disambiguation_paragraph", named_entity=entity, passage=passages[0])
-                entity_definition, meta_data, cache_hit = llm_model.infer(entity_definition)
-
-                this_definition_embedding = self.embedding_model.batch_encode([entity_definition])
-
-
+                # Second pass: remove marked indices in reverse order
+                for idx in sorted(indices_to_remove, reverse=True):
+                    entities_with_definition.pop(idx)
+                    if definition_embeddings is not None:
+                        # Remove the corresponding embedding
+                        definition_embeddings = np.concatenate([
+                            definition_embeddings[:idx],
+                            definition_embeddings[idx+1:]
+                        ])
+            if not collapsed:
+                entities_with_definition.append(f"{entity}@def: {entity_definition}")
                 if definition_embeddings is not None:
-                    embeddings = np.concatenate([this_definition_embedding, embeddings[1:], definition_embeddings])
                     definition_embeddings = np.concatenate([definition_embeddings, this_definition_embedding])
                 else:
-                    embeddings =  np.concatenate([this_definition_embedding, embeddings[1:]])       
                     definition_embeddings = this_definition_embedding
-                
-                # the definition entails the same entity
-                similarities = embeddings[0] @ embeddings[1:].T
-                connections = similarities > same_entity_threshold
-
-                collapsed = False
-                if num_current_definitions > 0:
-                    cd_connections = connections[-num_current_definitions:]
-                    connections = connections[:-num_current_definitions + 1]
-                    for i in range(len(cd_connections)):
-                        if cd_connections[i]:
-                            # definition collapsed
-                            collapsed = True
-                            break
-                if not collapsed:
-                    entities_with_definition.append(f"{entity}: {entity_definition}")
-                
-                # Remove passages that are too similar to the definition (index 0)
-                filtered_passages = []  # Keep the definition
-                connections = connections[1:]
-                embeddings_ = []
-                for i in range(len(connections)):
-                    if not connections[i]:  # If not similar to definition
-                        filtered_passages.append(passages[i+1])  # i+1 because connections is shorter by 1
-                        embeddings_.append(embeddings[i+1])
-                passages = filtered_passages
-                embeddings = np.array(embeddings_)
-                # other entities should be disambiguated
-                disambiguate_entity(entity, passages, same_entity_threshold, prompt_template_manager, llm_model, entities_with_definition, embeddings, definition_embeddings)
             
-            disambiguate_entity(entity, passages, same_entity_threshold, prompt_template_manager, llm_model, entities_with_definition, embeddings)
-            definitions += entities_with_definition
+            # Remove passages that are too similar to the definition (index 0)
+            filtered_passages = []  # Keep the definition
+            # connections = connections[1:]
+            embeddings_ = []
+            for i in range(len(connections)):
+                if not connections[i]:  # If similar to definition
+                    filtered_passages.append(passages[i+1])  # i+1 because connections is shorter by 1
+                    embeddings_.append(embeddings[i])
+            passages = filtered_passages
+            embeddings = np.array(embeddings_)
+
+            # print(len(passages), len(embeddings), len(entities_with_definition), len(definition_embeddings))
+
+            # other entities should be disambiguated
+            return await disambiguate_entity(entity, passages, same_entity_threshold, prompt_template_manager, llm_model, embeddings, entities_with_definition, definition_embeddings)
+        
+        async def process_entity(entity):
+            passages = [f"A textual record about \"{entity}\": {chunk_to_rows[chunk_id]['content']}" for chunk_id in entity_nodes2chunk_ids[entity]]
+            embeddings = self.embedding_model.batch_encode(passages)
+            return await disambiguate_entity(entity, passages, same_entity_threshold, prompt_template_manager, _get_llm_class(global_config), embeddings)
+
+        async def process_all_entities():
+            # Use the generic dynamic pool function
+            entities = list(entity_nodes2chunk_ids.keys())
+            
+            def on_result_success(entities_with_definition):
+                definitions.extend(entities_with_definition)
+                print(entities_with_definition)
+            
+            await run_with_dynamic_pool(
+                items=entities,
+                process_func=process_entity,
+                max_concurrent_tasks=200,
+                show_progress=True,
+                description="Processing entities",
+                on_success=on_result_success,
+                use_thread_pool=True
+            )
+        
+        # Run the entity processing
+        asyncio.run(process_all_entities())
         self.insert_strings(definitions)
 
     def union_find(self, connections: np.ndarray) -> List[Set[int]]:
@@ -171,7 +227,7 @@ class EmbeddingStore:
         nodes_dict = {}
 
         for text in texts:
-            nodes_dict[compute_mdhash_id(text, prefix=self.namespace + "-")] = {'content': text}
+            nodes_dict[compute_mdhash_id(text.split("@def:")[0], prefix=self.namespace + "-")] = {'content': text}
 
         # Get all hash_ids from the input dictionary.
         all_hash_ids = list(nodes_dict.keys())

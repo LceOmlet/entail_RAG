@@ -148,3 +148,229 @@ def string_to_bool(v):
         raise ArgumentTypeError(
             f"Truthy value expected: got {v} but expected one of yes/no, true/false, t/f, y/n, 1/0 (case insensitive)."
         )
+
+async def run_with_dynamic_pool(
+    items: list, 
+    process_func, 
+    max_concurrent_tasks: int = 10, 
+    show_progress: bool = True, 
+    description: str = "Processing",
+    on_success=None,
+    on_error=None,
+    use_thread_pool: bool = True,
+    verbose_logging: bool = False
+):
+    """
+    Run a collection of items through an async processing function using a dynamic task pool.
+    When tasks complete, new ones are automatically added to maintain concurrency.
+    
+    Args:
+        items: List of items to process
+        process_func: Async function that takes a single item and processes it
+        max_concurrent_tasks: Maximum number of concurrent tasks to run
+        show_progress: Whether to show a progress bar
+        description: Description for the progress bar
+        on_success: Optional callback function to run on successful completion of each task
+        on_error: Optional callback function to run when a task raises an exception
+        use_thread_pool: If True, run potentially blocking functions in a thread pool
+        verbose_logging: Enable detailed logging of task execution status
+    
+    Returns:
+        List of results from all successful tasks
+    """
+    import asyncio
+    from tqdm import tqdm
+    import logging
+    import concurrent.futures
+    import time
+    import inspect
+    
+    logger = logging.getLogger(__name__)
+    
+    if verbose_logging:
+        logger.info(f"Starting run_with_dynamic_pool with {len(items)} items, max_concurrent_tasks={max_concurrent_tasks}, use_thread_pool={use_thread_pool}")
+    
+    start_time = time.time()
+    results = []
+    
+    progress_bar = tqdm(total=len(items), desc=description) if show_progress else None
+    
+    # Track tasks with item indexes for better debugging
+    task_to_item = {}
+    completed_count = 0
+    error_count = 0
+    
+    # Track remaining items to process
+    remaining_items = items.copy()
+    
+    # Check if process_func is actually an async function
+    is_process_func_async = inspect.iscoroutinefunction(process_func)
+    if verbose_logging:
+        logger.info(f"Process function is{'n' if not is_process_func_async else ''} async: {is_process_func_async}")
+    
+    # Create thread pool for potentially blocking functions
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent_tasks) if use_thread_pool else None
+    if verbose_logging and executor:
+        logger.info(f"Created ThreadPoolExecutor with {max_concurrent_tasks} workers")
+    
+    async def wrapped_process_func(item, item_index):
+        """Wrap the process function to handle both async and sync functions"""
+        func_start_time = time.time()
+        
+        if verbose_logging:
+            logger.info(f"Starting task {item_index+1}/{len(items)} using {'thread pool' if use_thread_pool and executor else 'async call'}")
+        
+        try:
+            if use_thread_pool and executor:
+                if is_process_func_async:
+                    # For async functions in thread pool, we need a helper
+                    async def thread_helper():
+                        loop = asyncio.get_running_loop()
+                        def run_coroutine_in_thread():
+                            # Create a new event loop in the thread
+                            async_loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(async_loop)
+                            try:
+                                # Run the coroutine and return its result
+                                return async_loop.run_until_complete(process_func(item))
+                            finally:
+                                async_loop.close()
+                        
+                        # Run the helper in a thread
+                        return await loop.run_in_executor(executor, run_coroutine_in_thread)
+                    
+                    result = await thread_helper()
+                else:
+                    # Simple case: run non-async function in thread pool
+                    loop = asyncio.get_running_loop()
+                    result = await loop.run_in_executor(executor, process_func, item)
+            else:
+                # Run as normal async function
+                if is_process_func_async:
+                    result = await process_func(item)
+                else:
+                    # Handle non-async function in async context
+                    result = process_func(item)
+            
+            # Check if result is a coroutine that wasn't awaited
+            if inspect.iscoroutine(result):
+                logger.warning(f"Task {item_index+1} returned a coroutine that wasn't awaited. Will await it now.")
+                result = await result
+            
+            elapsed = time.time() - func_start_time
+            if verbose_logging:
+                logger.info(f"Task {item_index+1} completed successfully in {elapsed:.2f}s")
+            
+            return result
+        except Exception as e:
+            elapsed = time.time() - func_start_time
+            logger.error(f"Task {item_index+1} failed after {elapsed:.2f}s with error: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise
+    
+    def add_tasks_to_pool():
+        """Add new tasks to the pool up to max_concurrent_tasks"""
+        added_count = 0
+        
+        while len(task_to_item) < max_concurrent_tasks and remaining_items:
+            item_index = len(items) - len(remaining_items)
+            item = remaining_items.pop(0)
+            
+            task = asyncio.create_task(wrapped_process_func(item, item_index))
+            task_to_item[task] = (item, item_index)
+            added_count += 1
+        
+        if verbose_logging and added_count > 0:
+            logger.info(f"Added {added_count} new tasks to pool. Current pool size: {len(task_to_item)}, Remaining items: {len(remaining_items)}")
+    
+    try:
+        # Initial filling of the task pool
+        add_tasks_to_pool()
+        
+        # Process until all tasks are completed
+        cycle_count = 0
+        while task_to_item:
+            cycle_count += 1
+            cycle_start = time.time()
+            
+            if verbose_logging:
+                logger.info(f"Cycle {cycle_count}: Waiting for tasks to complete. Active tasks: {len(task_to_item)}, Completed: {completed_count}, Errors: {error_count}, Remaining: {len(remaining_items)}")
+            
+            # Wait for at least one task to complete with timeout
+            done, pending = await asyncio.wait(
+                task_to_item.keys(), 
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=5.0  # Add timeout to avoid hanging indefinitely
+            )
+            
+            cycle_elapsed = time.time() - cycle_start
+            if verbose_logging:
+                logger.info(f"Cycle {cycle_count} completed in {cycle_elapsed:.2f}s with {len(done)} tasks done")
+            
+            if not done:
+                logger.warning(f"Cycle {cycle_count}: No tasks completed within 5s timeout. This may indicate blocking operations. Active tasks: {len(task_to_item)}")
+                # Diagnostics on pending tasks
+                if verbose_logging:
+                    for i, task in enumerate(task_to_item.keys()):
+                        item, idx = task_to_item[task]
+                        logger.info(f"  Pending task {i+1}: item index {idx}, task done: {task.done()}, cancelled: {task.cancelled()}")
+                continue
+            
+            # Process completed tasks
+            for task in done:
+                item, item_index = task_to_item.pop(task)
+                
+                try:
+                    result = task.result()
+                    
+                    # Double-check if result is a coroutine (this shouldn't happen, but just in case)
+                    if inspect.iscoroutine(result):
+                        logger.warning(f"Task {item_index+1} result is a coroutine! This indicates an error in wrapped_process_func.")
+                        logger.warning("Attempting to await the coroutine to get the actual result.")
+                        result = await result
+                    
+                    results.append(result)
+                    completed_count += 1
+                    
+                    if on_success:
+                        if verbose_logging:
+                            logger.info(f"Calling on_success callback for task {item_index+1}")
+                        try:
+                            on_success(result)
+                        except Exception as callback_error:
+                            logger.error(f"Error in on_success callback for task {item_index+1}: {callback_error}")
+                            import traceback
+                            traceback.print_exc()
+                            # Continue processing other tasks rather than failing everything
+                            error_count += 1
+                except Exception as e:
+                    error_count += 1
+                    if on_error:
+                        if verbose_logging:
+                            logger.info(f"Calling on_error callback for task {item_index+1}")
+                        on_error(e)
+                    else:
+                        logger.error(f"Error processing item {item_index+1}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                  
+                if progress_bar:
+                    progress_bar.update(1)
+            
+            # Immediately refill the task pool after processing completed tasks
+            add_tasks_to_pool()
+    
+    finally:
+        total_elapsed = time.time() - start_time
+        logger.info(f"Finished processing: {completed_count} completed, {error_count} errors in {total_elapsed:.2f}s")
+        
+        if progress_bar:
+            progress_bar.close()
+        
+        if executor:
+            if verbose_logging:
+                logger.info("Shutting down thread pool executor")
+            executor.shutdown(wait=False)
+    
+    return results

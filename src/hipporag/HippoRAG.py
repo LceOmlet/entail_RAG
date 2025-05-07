@@ -270,7 +270,7 @@ class HippoRAG:
         facts = flatten_facts(chunk_triples)
 
         logger.info(f"Encoding Entities")
-        self.entity_embedding_store.insert_entities(entity_nodes2chunk_ids, entity_nodes2triples, chunk_to_rows, self.global_config.same_entity_threshold, self.prompt_template_manager, self.llm_model)
+        self.entity_embedding_store.insert_entities(entity_nodes2chunk_ids, entity_nodes2triples, chunk_to_rows, self.global_config.same_entity_threshold, self.prompt_template_manager, self.global_config)
 
         logger.info(f"Encoding Facts")
         self.fact_embedding_store.insert_strings([str(fact) for fact in facts])
@@ -875,9 +875,6 @@ class HippoRAG:
         # Using the imported template instead of hardcoding it
         
 
-        self.node_to_node_stats[(node_key, nn)] = score
-        self.node_to_node_stats[(nn, node_key)] = score
-
         for node_key in tqdm(query_node_key2knn_node_keys.keys(), total=len(query_node_key2knn_node_keys)):
             synonyms = []
 
@@ -892,6 +889,9 @@ class HippoRAG:
                         break
 
                     nn_phrase = self.entity_id_to_row[nn]["content"]
+
+                    self.node_to_node_stats[(node_key, nn)] = score
+                    self.node_to_node_stats[(nn, node_key)] = score
 
                     if nn != node_key and nn_phrase != '':
                         # Check entailment in both directions using LLM
